@@ -13,9 +13,9 @@
 //! - `ELASTIC_APM_API_KEY` (authorization api key)
 
 use axum::{
-    extract::{ConnectInfo, Request},
-    http::{header, Version},
-    response::Response,
+    extract::{ConnectInfo, Request, State},
+    http::{header, Version, StatusCode, Uri},
+    response::{IntoResponse, Response},
 };
 use opentelemetry::{global, KeyValue};
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
@@ -268,4 +268,67 @@ pub fn apm_trace_layer() -> TraceLayer<
                 span.record("http.response.header.content-type", content_type);
             }
         })
+}
+
+/// Type alias for the Hyper legacy client used to forward requests.
+pub type ProxyClient = hyper_util::client::legacy::Client<
+    hyper_util::client::legacy::connect::HttpConnector,
+    axum::body::Body,
+>;
+
+/// Default handler for proxying incoming HTTP requests to an upstream target.
+///
+/// It reads the `UPSTREAM_URL` environment variable (default: `https://httpbin.org`),
+/// replaces the host headers, rewrites the request URI, and forwards it using the
+/// legacy Hyper client.
+#[tracing::instrument(skip(client, req), fields(upstream_uri))]
+pub async fn proxy_handler(
+    State(client): State<ProxyClient>,
+    mut req: Request,
+) -> Result<Response, StatusCode> {
+    // Retrieve upstream server URL
+    let upstream_url = std::env::var("UPSTREAM_URL")
+        .unwrap_or_else(|_| "https://httpbin.org".to_string());
+
+    // Retrieve path and query from the incoming request URI
+    let path_query = req
+        .uri()
+        .path_and_query()
+        .map(|v| v.as_str())
+        .unwrap_or("/");
+
+    // Construct the destination URI pointing to the upstream server
+    let uri_str = format!("{}{}", upstream_url.trim_end_matches('/'), path_query);
+    let target_uri = uri_str.parse::<Uri>().map_err(|e| {
+        tracing::error!("Failed to parse target URI: {}", e);
+        StatusCode::BAD_REQUEST
+    })?;
+
+    // Record target URI and details in the current tracing span
+    let span = Span::current();
+    span.record("upstream_uri", &uri_str);
+    
+    // Update the request URI to target the upstream server
+    *req.uri_mut() = target_uri;
+
+    // Rewrite the Host header to match the new destination
+    if let Some(host) = req.uri().host() {
+        let host_val = if let Some(port) = req.uri().port_u16() {
+            format!("{}:{}", host, port)
+        } else {
+            host.to_string()
+        };
+
+        if let Ok(header_val) = header::HeaderValue::from_str(&host_val) {
+            req.headers_mut().insert(header::HOST, header_val);
+        }
+    }
+
+    // Forward the request to the upstream using the hyper client
+    let response = client.request(req).await.map_err(|e| {
+        tracing::error!("Failed to proxy request: {}", e);
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    Ok(response.into_response())
 }
