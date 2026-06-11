@@ -8,7 +8,6 @@
 //! - `ELASTIC_APM_SERVICE_NAME` (default: `rust-service`)
 //! - `ELASTIC_APM_SERVICE_VERSION` (default: `1.0.0`)
 //! - `ELASTIC_APM_ENVIRONMENT` (default: `production`)
-//! - `ELASTIC_APM_NODE_NAME` (falls back to hostname)
 //! - `ELASTIC_APM_SECRET_TOKEN` (authorization bearer token)
 //! - `ELASTIC_APM_API_KEY` (authorization api key)
 
@@ -22,9 +21,26 @@ use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::{trace::SdkTracerProvider, Resource};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 use tracing::{info, info_span, Span};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+/// Application state containing the HTTP client and upstream configuration.
+#[derive(Clone)]
+pub struct AppState {
+    pub client: ProxyClient,
+    pub upstream_url: Arc<String>,
+}
+
+/// Helper function to extract a header value as a string.
+fn extract_header(headers: &axum::http::HeaderMap, header_name: axum::http::header::HeaderName) -> String {
+    headers
+        .get(header_name)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("")
+        .to_string()
+}
 
 /// Initializes the OpenTelemetry tracing provider and registers it globally
 /// alongside a standard terminal logging layer.
@@ -40,9 +56,11 @@ pub fn init_apm() -> Result<SdkTracerProvider, Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "production".to_string());
     let apm_server_url = std::env::var("ELASTIC_APM_SERVER_URL")
         .unwrap_or_else(|_| "http://localhost:8200".to_string());
-    let apm_node_name = std::fs::read_to_string("/proc/sys/kernel/hostname")
+
+    // Get node name from system hostname (cross-platform)
+    let apm_node_name = hostname::get()
         .ok()
-        .map(|s| s.trim().to_string());
+        .map(|h| h.to_string_lossy().into_owned());
 
     // Construct the OTLP HTTP traces target endpoint (Elastic APM listens on /v1/traces)
     let traces_endpoint = format!("{}/v1/traces", apm_server_url.trim_end_matches('/'));
@@ -62,8 +80,8 @@ pub fn init_apm() -> Result<SdkTracerProvider, Box<dyn std::error::Error>> {
     }
 
     info!(
-        "Initializing OpenTelemetry OTLP Exporter targeting: {} (node: {:?}, authenticated: {})",
-        traces_endpoint, apm_node_name, !headers.is_empty()
+        "Initializing OpenTelemetry OTLP Exporter targeting: {}",
+        traces_endpoint
     );
 
     // 1. Build the OTLP Span Exporter using HTTP
@@ -191,32 +209,16 @@ pub fn apm_trace_layer() -> TraceLayer<
                 });
 
             // Extract User Agent
-            let user_agent = request.headers()
-                .get(header::USER_AGENT)
-                .and_then(|h| h.to_str().ok())
-                .unwrap_or("")
-                .to_string();
+            let user_agent = extract_header(request.headers(), header::USER_AGENT);
 
             // Extract Referrer header
-            let referrer = request.headers()
-                .get(header::REFERER)
-                .and_then(|h| h.to_str().ok())
-                .unwrap_or("")
-                .to_string();
+            let referrer = extract_header(request.headers(), header::REFERER);
 
             // Extract Content-Type
-            let content_type = request.headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|h| h.to_str().ok())
-                .unwrap_or("")
-                .to_string();
+            let content_type = extract_header(request.headers(), header::CONTENT_TYPE);
 
             // Extract Accept header
-            let accept = request.headers()
-                .get(header::ACCEPT)
-                .and_then(|h| h.to_str().ok())
-                .unwrap_or("")
-                .to_string();
+            let accept = extract_header(request.headers(), header::ACCEPT);
 
             // Format transaction name dynamically as "GET /path"
             let otel_name = format!("{} {}", method, path);
@@ -278,18 +280,13 @@ pub type ProxyClient = hyper_util::client::legacy::Client<
 
 /// Default handler for proxying incoming HTTP requests to an upstream target.
 ///
-/// It reads the `UPSTREAM_URL` environment variable (default: `https://httpbin.org`),
-/// replaces the host headers, rewrites the request URI, and forwards it using the
-/// legacy Hyper client.
-#[tracing::instrument(skip(client, req), fields(upstream_uri))]
+/// Uses the upstream URL from `AppState` instead of reading environment variables
+/// on each request for better performance.
+#[tracing::instrument(skip(state, req), fields(upstream_uri))]
 pub async fn proxy_handler(
-    State(client): State<ProxyClient>,
+    State(state): State<AppState>,
     mut req: Request,
 ) -> Result<Response, StatusCode> {
-    // Retrieve upstream server URL
-    let upstream_url = std::env::var("UPSTREAM_URL")
-        .unwrap_or_else(|_| "https://httpbin.org".to_string());
-
     // Retrieve path and query from the incoming request URI
     let path_query = req
         .uri()
@@ -298,7 +295,7 @@ pub async fn proxy_handler(
         .unwrap_or("/");
 
     // Construct the destination URI pointing to the upstream server
-    let uri_str = format!("{}{}", upstream_url.trim_end_matches('/'), path_query);
+    let uri_str = format!("{}{}", state.upstream_url.trim_end_matches('/'), path_query);
     let target_uri = uri_str.parse::<Uri>().map_err(|e| {
         tracing::error!("Failed to parse target URI: {}", e);
         StatusCode::BAD_REQUEST
@@ -325,7 +322,7 @@ pub async fn proxy_handler(
     }
 
     // Forward the request to the upstream using the hyper client
-    let response = client.request(req).await.map_err(|e| {
+    let response = state.client.request(req).await.map_err(|e| {
         tracing::error!("Failed to proxy request: {}", e);
         StatusCode::BAD_GATEWAY
     })?;

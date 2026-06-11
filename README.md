@@ -11,7 +11,6 @@ It captures comprehensive standard OTel/ECS (Elastic Common Schema) HTTP metadat
 - **Standard OTel & ECS Semantic Conventions**: Automatically records full URL, host, protocol details, user agent, referer, response body bytes, client IP (from socket socket/`ConnectInfo` or `X-Forwarded-For`), and HTTP status codes.
 - **Dynamic APM Transaction Naming**: Bypasses compile-time static string limits to format spans dynamically matching their HTTP pathing (e.g., `GET /path`).
 - **Flexible Authentication**: Reads native `ELASTIC_APM_SECRET_TOKEN` and `ELASTIC_APM_API_KEY` to automatically structure HTTP headers (`Bearer` or `ApiKey`).
-- **Automatic Fallback Hostname**: Reads system hostname if `ELASTIC_APM_NODE_NAME` is missing.
 
 ---
 
@@ -38,10 +37,15 @@ Add these dependencies to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-axum = { version = "0.8.9", features = ["macros"] }
-tokio = { version = "1.52.3", features = ["full"] }
-tracing = "0.1.44"
-tower-http = { version = "0.6.11", features = ["trace"] }
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1.52", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
+tower-http = { version = "0.6", features = ["trace"] }
+opentelemetry = { version = "0.32", features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", features = ["http-proto", "reqwest-blocking-client"] }
+tracing-opentelemetry = "0.33"
 # The library dependency (if integrated locally or published)
 rust-reverse-proxy = { path = "." }
 ```
@@ -100,10 +104,9 @@ use axum::{
     Router,
 };
 use hyper_util::{client::legacy::connect::HttpConnector, rt::TokioExecutor};
-use rust_reverse_proxy::{apm_trace_layer, init_apm};
+use rust_reverse_proxy::{apm_trace_layer, init_apm, AppState, ProxyClient};
 use std::net::SocketAddr;
-
-type Client = hyper_util::client::legacy::Client<HttpConnector, axum::body::Body>;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -111,13 +114,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _tracer_provider = init_apm()?;
 
     // 2. Create the proxy HTTP client
-    let client: Client = hyper_util::client::legacy::Client::<(), ()>::builder(TokioExecutor::new())
+    let client: ProxyClient = hyper_util::client::legacy::Client::<(), ()>::builder(TokioExecutor::new())
         .build(HttpConnector::new());
 
-    // 3. Apply the fallback handler and the APM tracing layer
+    // 3. Read upstream URL once at startup
+    let upstream_url = std::env::var("UPSTREAM_URL")
+        .unwrap_or_else(|_| "https://httpbin.org".to_string());
+
+    // 4. Create application state
+    let state = AppState {
+        client,
+        upstream_url: Arc::new(upstream_url),
+    };
+
+    // 5. Apply the fallback handler and the APM tracing layer
     let app = Router::new()
         .fallback(proxy_handler)
-        .with_state(client)
+        .with_state(state)
         .layer(apm_trace_layer());
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
@@ -131,22 +144,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn proxy_handler(
-    State(client): State<Client>,
+    State(state): State<AppState>,
     mut req: Request,
 ) -> Result<Response, StatusCode> {
-    let upstream_url = "https://httpbin.org";
     let path_query = req.uri().path_and_query().map(|v| v.as_str()).unwrap_or("/");
-    let uri_str = format!("{}{}", upstream_url, path_query);
+    let uri_str = format!("{}{}", state.upstream_url.trim_end_matches('/'), path_query);
     
     *req.uri_mut() = uri_str.parse::<Uri>().map_err(|_| StatusCode::BAD_REQUEST)?;
 
     if let Some(host) = req.uri().host() {
-        if let Ok(val) = header::HeaderValue::from_str(host) {
+        let host_val = if let Some(port) = req.uri().port_u16() {
+            format!("{}:{}", host, port)
+        } else {
+            host.to_string()
+        };
+        if let Ok(val) = header::HeaderValue::from_str(&host_val) {
             req.headers_mut().insert(header::HOST, val);
         }
     }
 
-    let response = client.request(req).await.map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let response = state.client.request(req).await.map_err(|_| StatusCode::BAD_GATEWAY)?;
     Ok(response.into_response())
 }
 ```
