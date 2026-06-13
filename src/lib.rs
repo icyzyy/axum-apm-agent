@@ -105,7 +105,7 @@ pub fn init_apm() -> Result<SdkTracerProvider, Box<dyn std::error::Error>> {
         .with_batch_exporter(exporter)
         .with_resource(
             Resource::builder()
-                .with_service_name(service_name)
+                .with_service_name(service_name.clone())
                 .with_attributes(attributes)
                 .build(),
         )
@@ -120,7 +120,7 @@ pub fn init_apm() -> Result<SdkTracerProvider, Box<dyn std::error::Error>> {
 
     // 5. Connect tracing subscriber with OpenTelemetry registry layer
     use opentelemetry::trace::TracerProvider;
-    let tracer = provider.tracer("rust-service");
+    let tracer = provider.tracer(service_name.clone());
     let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
 
     tracing_subscriber::registry()
@@ -204,7 +204,7 @@ pub fn apm_trace_layer() -> TraceLayer<
                         .and_then(|h| h.to_str().ok())
                         .and_then(|s| s.split(',').next())
                         .map(|s| s.trim().to_string())
-                        .unwrap_or_else(|| "".to_string());
+                        .unwrap_or_default();
                     (ip, 0)
                 });
 

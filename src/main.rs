@@ -45,7 +45,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("Reverse proxy listening on {} -> proxying to {}", addr, upstream_url);
 
-    axum::serve(listener, app).await?;
+    // Run server with graceful shutdown on SIGTERM/SIGINT
+    let server = axum::serve(listener, app);
+    let shutdown_signal = async {
+        tokio::signal::ctrl_c().await.ok();
+        tracing::info!("Received shutdown signal, starting graceful shutdown...");
+    };
+
+    server.with_graceful_shutdown(shutdown_signal).await?;
 
     // Ensure all remaining telemetry spans are flushed before server exits
     if let Err(err) = _tracer_provider.shutdown() {
