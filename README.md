@@ -2,15 +2,22 @@
 
 A lightweight, production-grade telemetry library designed to integrate **Axum** applications (either **REST APIs** or **Reverse Proxies**) with **Elastic APM** via native **OpenTelemetry (OTLP/HTTP)**.
 
-It captures comprehensive standard OTel/ECS (Elastic Common Schema) HTTP metadata, automatically handles auth tokens and API keys, and dynamically names APM transactions (e.g., `GET /api/v1/users`).
+It captures comprehensive standard OTel/ECS (Elastic Common Schema) HTTP metadata, automatically handles auth tokens and API keys, dynamically names APM transactions (e.g., `GET /api/v1/users`), and propagates W3C trace context (`traceparent`) across service boundaries.
 
 ---
 
 ## Features
 
-- **Standard OTel & ECS Semantic Conventions**: Automatically records full URL, host, protocol details, user agent, referer, response body bytes, client IP (from socket socket/`ConnectInfo` or `X-Forwarded-For`), and HTTP status codes.
-- **Dynamic APM Transaction Naming**: Bypasses compile-time static string limits to format spans dynamically matching their HTTP pathing (e.g., `GET /path`).
+- **Standard OTel & ECS Semantic Conventions**: Automatically records full URL, host, protocol details, user agent, referer, response body bytes (when the upstream sends `Content-Length`), client IP (from the socket via `ConnectInfo` or `X-Forwarded-For`), and HTTP status codes.
+- **Route-Pattern Transaction Naming**: Names transactions by the matched **route pattern** (e.g. `GET /users/{id}`) via axum's `MatchedPath`, keeping the APM transaction view bounded instead of fragmenting it per concrete path. Falls back to the actual path when no route matched, and records `http.route = "unknown route"` for 404/405 — mirroring the Go agent's `apmechov4` naming.
+- **Panic & Error Capture**: An optional `apm_panic_recovery_layer()` recovers handler panics into a `500` response (instead of dropping the connection) and records them as APM errors (`exception` span event + error status). 5xx handler responses are already captured as APM errors via the span status.
+- **Zero-Overhead Disable Switch**: `ELASTIC_APM_ACTIVE` / `ELASTIC_APM_RECORDING` (both default `true`) short-circuit the trace layer to a no-op when disabled, so APM can be turned off with no tracing/OTel overhead (no OTel span is created or exported).
+- **Server Span Kind**: HTTP request spans are exported with `SpanKind::Server` so APM categorizes them correctly in the service map.
+- **W3C Trace Context Propagation**: Incoming `traceparent` headers continue the caller's trace; proxied requests carry `traceparent` to the upstream, so end-to-end traces stay connected across the proxy.
 - **Flexible Authentication**: Reads native `ELASTIC_APM_SECRET_TOKEN` and `ELASTIC_APM_API_KEY` to automatically structure HTTP headers (`Bearer` or `ApiKey`).
+- **Transaction Sampling**: Configurable URL ignore patterns (exact, glob, regex) and per-transaction sample rate to reduce APM overhead on health checks and high-traffic endpoints.
+
+> **Note on auth tokens:** the OTLP exporter URL-decodes header values before sending. If your secret token or API key contains `%XX` sequences, they will be altered in transit — avoid such characters in credentials.
 
 ---
 
@@ -24,8 +31,109 @@ Configure your application using the following environment variables:
 | `ELASTIC_APM_SERVICE_NAME` | Service name registered in Elastic APM | `rust-service` |
 | `ELASTIC_APM_SERVICE_VERSION` | Version of the service | `1.0.0` |
 | `ELASTIC_APM_ENVIRONMENT` | Deployment environment (e.g., `production`, `staging`) | `production` |
+| `ELASTIC_APM_NODE_NAME` | Node name reported to APM | system hostname |
 | `ELASTIC_APM_SECRET_TOKEN` | Bearer Token for APM authentication | None |
 | `ELASTIC_APM_API_KEY` | API Key for APM authentication | None |
+| `ELASTIC_APM_TRANSACTION_IGNORE_URLS` | Comma-separated URL patterns to exclude from tracing | (none) |
+| `ELASTIC_APM_TRANSACTION_SAMPLE_RATE` | Float 0.0–1.0, sampling rate for transactions | `1.0` |
+| `ELASTIC_APM_ACTIVE` | Master switch; when `false` the trace layer creates and exports no spans | `true` |
+| `ELASTIC_APM_RECORDING` | When `false` the trace layer creates and exports no spans (agent active but not recording) | `true` |
+
+For the reverse proxy binary:
+
+| Variable | Description | Default |
+| :--- | :--- | :--- |
+| `UPSTREAM_URL` | **Required.** Absolute URL of the upstream server | (none — the binary fails to start without it) |
+| `PORT` | Port the proxy listens on | `3000` |
+
+---
+
+## Transaction Sampling
+
+### Ignoring URLs
+
+Use `ELASTIC_APM_TRANSACTION_IGNORE_URLS` to exclude specific URLs from being traced. This is useful for health checks, metrics endpoints, and other high-frequency, low-value traffic:
+
+```bash
+# Exact match
+ELASTIC_APM_TRANSACTION_IGNORE_URLS=/health,/metrics
+
+# Glob patterns with wildcard
+ELASTIC_APM_TRANSACTION_IGNORE_URLS=/health,/metrics,/status/*
+
+# Regular expressions
+ELASTIC_APM_TRANSACTION_IGNORE_URLS=^/api/v1/health.*,/health
+
+# Mix of all pattern types
+ELASTIC_APM_TRANSACTION_IGNORE_URLS=/health,/metrics,^/api/v[0-9]+/internal.*
+```
+
+**Pattern types:**
+- **Exact match**: `/health` — matches only the exact path (not `/healthcheck` or `/health/live`)
+- **Glob**: `/status/*` or `/api/v1/**` — `*` matches any sequence of characters, `?` matches exactly one character
+- **Regex**: `^/api/v1/health.*` — full regex support; patterns starting with `^` or ending with `$` are treated as regex
+
+### Sampling Rate
+
+Use `ELASTIC_APM_TRANSACTION_SAMPLE_RATE` to control what fraction of transactions are sampled:
+
+```bash
+# Sample all transactions (default)
+ELASTIC_APM_TRANSACTION_SAMPLE_RATE=1.0
+
+# Sample 50% of transactions
+ELASTIC_APM_TRANSACTION_SAMPLE_RATE=0.5
+
+# Sample 10% of transactions
+ELASTIC_APM_TRANSACTION_SAMPLE_RATE=0.1
+
+# Disable sampling (drop all transactions)
+ELASTIC_APM_TRANSACTION_SAMPLE_RATE=0.0
+```
+
+The sampler uses **trace-id-ratio-based** sampling, which is compatible with distributed tracing:
+- **Respects parent decisions**: If a parent span is sampled, all child spans are sampled (ensures trace consistency)
+- **Deterministic per trace**: The same trace ID always produces the same sampling decision
+- **Ignores first**: URLs matching `ELASTIC_APM_TRANSACTION_IGNORE_URLS` are dropped before the sampling rate is applied
+- **Fail-safe**: An invalid value (e.g. `0,1`, `nan`, `2.0`) logs a warning and falls back to `1.0`
+
+---
+
+## Transaction Naming & Error Capture
+
+### Route-Pattern Transaction Naming
+
+By default, APM transactions are named by the **matched route pattern** (e.g. `GET /users/{id}`) rather than the concrete path (e.g. `GET /users/123`). This keeps the APM transaction view bounded — a single transaction per route, not one per ID.
+
+The library reads axum's [`MatchedPath`](https://docs.rs/axum/latest/axum/extract/struct.MatchedPath.html) request extension, which axum populates after route matching. Because the tracing layer is applied to the router (via `.layer(...)`), axum runs the layer *after* matching, so the pattern is available when the span is created.
+
+- **Matched route** → span named `METHOD + " " + pattern`, and `http.route` set to the pattern.
+- **No route matched** (e.g. a reverse-proxy fallback) → span named by the actual path.
+- **404 / 405** → `http.route` recorded as `"unknown route"`, mirroring the Go agent's `UnknownRouteRequestName`.
+
+> **Note:** a matched route whose *handler* returns 404/405 (e.g. "resource not found") has its `http.route` overwritten to `"unknown route"` at response time; the span name (the APM transaction name) remains the route pattern, so the transaction view is unaffected.
+
+### Panic & Error Capture
+
+Handler panics are not recovered by axum by default — the connection is dropped and nothing reaches APM. The optional `apm_panic_recovery_layer()` fixes this:
+
+- Recovers a handler panic into a `500 Internal Server Error` response (the connection is not dropped).
+- Records the panic on the APM span: an `exception` span event (`exception.type = "#Panic"`, `exception.message = <panic message>`) plus `error.type` / `error.message` fields, so it appears in APM's **Errors** section.
+
+Apply it *inside* `apm_trace_layer()` so the APM span is active when the panic is caught:
+
+```rust
+let app = Router::new()
+    .route("/users/{id}", get(user_handler))
+    .layer(axum_apm::apm_panic_recovery_layer()) // inner: recovers panics
+    .layer(axum_apm::apm_trace_layer());         // outer: creates the span
+```
+
+5xx handler responses are already captured as APM errors (the trace layer sets the span status to `Error` for server errors), so no extra layer is needed for non-panic errors.
+
+### Disabling APM
+
+Set `ELASTIC_APM_ACTIVE=false` or `ELASTIC_APM_RECORDING=false` to turn APM off. When disabled, the trace layer returns a no-op span, so no OTel span is created or exported — a zero-overhead short-circuit (mirroring the Go agent's `Recording()` check). This is useful for local development or for temporarily disabling APM without code changes.
 
 ---
 
@@ -41,13 +149,9 @@ axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1.52", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
-tower-http = { version = "0.6", features = ["trace"] }
-opentelemetry = { version = "0.32", features = ["trace"] }
-opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.32", features = ["http-proto", "reqwest-blocking-client"] }
-tracing-opentelemetry = "0.33"
+serde_json = "1"
 # The library dependency (if integrated locally or published)
-rust-reverse-proxy = { path = "." }
+axum-apm = { path = "." }
 ```
 
 ### 2. Usage in a REST API
@@ -56,30 +160,53 @@ Here is how you would use this library in a typical Axum REST API:
 
 ```rust
 use axum::{routing::get, Json, Router};
-use rust_reverse_proxy::{apm_trace_layer, init_apm};
+use axum_apm::{apm_otel_layer, apm_panic_recovery_layer, apm_trace_layer, init_apm};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Initialize OpenTelemetry APM provider
-    let _tracer_provider = init_apm()?;
+    // 1. Initialize the OpenTelemetry APM provider
+    let (tracer_provider, config) = init_apm()?;
 
-    // 2. Define routes and apply the tracing middleware layer
+    // 2. Compose the OTel layer into your own tracing subscriber
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(tracing_subscriber::fmt::layer())
+        .with(apm_otel_layer(&tracer_provider))
+        .init();
+
+    // Surface configuration warnings now that the subscriber can receive them
+    for warning in &config.warnings {
+        tracing::warn!("{warning}");
+    }
+
+    // 3. Define routes and apply the APM layers:
+    //    - apm_panic_recovery_layer (inner): recovers handler panics into a 500
+    //      and records them as APM errors.
+    //    - apm_trace_layer (outer): creates the APM span (named by the route
+    //      pattern when the request matches a route).
     let app = Router::new()
         .route("/api/hello", get(hello_handler))
         .route("/api/status", get(status_handler))
+        .layer(apm_panic_recovery_layer())
         .layer(apm_trace_layer());
 
-    // 3. Serve the application with socket connections
+    // 4. Serve the application
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("REST API listening on {}", addr);
-    
-    axum::serve(listener, app).await?;
 
-    // Optional: explicit flush/shutdown on exit
-    let _ = _tracer_provider.shutdown();
+    let server = axum::serve(listener, app);
+    let shutdown_signal = async {
+        tokio::signal::ctrl_c().await.ok();
+        tracing::info!("Received shutdown signal, starting graceful shutdown...");
+    };
+    server.with_graceful_shutdown(shutdown_signal).await?;
+
+    // Flush remaining spans before exit
+    let _ = tracer_provider.shutdown();
     Ok(())
 }
 
@@ -94,40 +221,48 @@ async fn status_handler() -> Json<Value> {
 
 ### 3. Usage in a Reverse Proxy
 
-Here is how you would use this library in a dynamic reverse proxy:
+The library ships a ready-made `proxy_handler` fallback that forwards every request to `UPSTREAM_URL` (and propagates the trace context to the upstream):
 
 ```rust
-use axum::{
-    extract::{Request, State},
-    http::{header, StatusCode, Uri},
-    response::{IntoResponse, Response},
-    Router,
-};
+use axum::Router;
+use axum_apm::{apm_otel_layer, apm_trace_layer, init_apm, proxy_handler, AppState, ProxyClient};
 use hyper_util::{client::legacy::connect::HttpConnector, rt::TokioExecutor};
-use rust_reverse_proxy::{apm_trace_layer, init_apm, AppState, ProxyClient};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Initialize OpenTelemetry APM provider
-    let _tracer_provider = init_apm()?;
+    // 1. Initialize the OpenTelemetry APM provider
+    let (tracer_provider, config) = init_apm()?;
 
-    // 2. Create the proxy HTTP client
-    let client: ProxyClient = hyper_util::client::legacy::Client::<(), ()>::builder(TokioExecutor::new())
-        .build(HttpConnector::new());
+    // 2. Compose the OTel layer into your own tracing subscriber
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(tracing_subscriber::fmt::layer())
+        .with(apm_otel_layer(&tracer_provider))
+        .init();
 
-    // 3. Read upstream URL once at startup
-    let upstream_url = std::env::var("UPSTREAM_URL")
-        .unwrap_or_else(|_| "https://httpbin.org".to_string());
+    // Surface configuration warnings now that the subscriber can receive them
+    for warning in &config.warnings {
+        tracing::warn!("{warning}");
+    }
 
-    // 4. Create application state
+    // 3. Create the proxy HTTP client
+    let client: ProxyClient =
+        hyper_util::client::legacy::Client::<(), ()>::builder(TokioExecutor::new())
+            .build(HttpConnector::new());
+
+    // 4. Read upstream URL once at startup (required, validated)
+    let upstream_url = axum_apm::resolve_upstream_url()?;
+
+    // 5. Create application state
     let state = AppState {
         client,
-        upstream_url: Arc::new(upstream_url),
+        upstream_url: Arc::new(upstream_url.clone()),
     };
 
-    // 5. Apply the fallback handler and the APM tracing layer
+    // 6. Apply the fallback handler and the APM tracing layer
     let app = Router::new()
         .fallback(proxy_handler)
         .with_state(state)
@@ -135,35 +270,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("Reverse proxy listening on {}", addr);
+    tracing::info!("Reverse proxy listening on {} -> proxying to {}", addr, upstream_url);
 
-    axum::serve(listener, app).await?;
-    
-    let _ = _tracer_provider.shutdown();
+    let server = axum::serve(listener, app);
+    let shutdown_signal = async {
+        tokio::signal::ctrl_c().await.ok();
+        tracing::info!("Received shutdown signal, starting graceful shutdown...");
+    };
+    server.with_graceful_shutdown(shutdown_signal).await?;
+
+    // Flush remaining spans before exit
+    let _ = tracer_provider.shutdown();
     Ok(())
 }
-
-async fn proxy_handler(
-    State(state): State<AppState>,
-    mut req: Request,
-) -> Result<Response, StatusCode> {
-    let path_query = req.uri().path_and_query().map(|v| v.as_str()).unwrap_or("/");
-    let uri_str = format!("{}{}", state.upstream_url.trim_end_matches('/'), path_query);
-    
-    *req.uri_mut() = uri_str.parse::<Uri>().map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    if let Some(host) = req.uri().host() {
-        let host_val = if let Some(port) = req.uri().port_u16() {
-            format!("{}:{}", host, port)
-        } else {
-            host.to_string()
-        };
-        if let Ok(val) = header::HeaderValue::from_str(&host_val) {
-            req.headers_mut().insert(header::HOST, val);
-        }
-    }
-
-    let response = state.client.request(req).await.map_err(|_| StatusCode::BAD_GATEWAY)?;
-    Ok(response.into_response())
-}
 ```
+
+The repository also contains a complete binary (`src/main.rs`) implementing this proxy, with graceful shutdown on Ctrl-C.
+
+---
+
+## Local Development
+
+A `docker-compose.yml` is provided with a local Elastic stack (APM Server + Elasticsearch + Kibana, all 8.19.x) for testing:
+
+```bash
+docker compose up -d
+```
+
+- APM Server: `http://localhost:8200` (OTLP/HTTP intake at `/v1/traces`)
+- Kibana: `http://localhost:5601` (APM app)
+- Elasticsearch: `http://localhost:9200`
+
+> **APM Server version requirement:** OTLP/HTTP intake requires APM Server **8.3.0 or newer**. The compose file pins 8.19.x.
+
+Then run the proxy binary:
+
+```bash
+UPSTREAM_URL=https://httpbin.org PORT=3000 cargo run
+curl http://localhost:3000/get
+```
+
+Spans appear in Kibana → Observability → APM within a few seconds (batch export).

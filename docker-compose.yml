@@ -1,70 +1,65 @@
-version: '2.2'
+# Local development stack for testing the axum-apm library.
+#
+# APM Server 8.x accepts OTLP/HTTP on port 8200 (the `/v1/traces` endpoint
+# this library exports to). Security is disabled for local development.
 services:
   apm-server:
-    image: docker.elastic.co/apm/apm-server:7.6.2
+    image: docker.elastic.co/apm/apm-server:8.19.25
     depends_on:
       elasticsearch:
         condition: service_healthy
       kibana:
         condition: service_healthy
-    cap_add: ["CHOWN", "DAC_OVERRIDE", "SETGID", "SETUID"]
-    cap_drop: ["ALL"]
     ports:
-    - 8200:8200
+      - 8200:8200
     networks:
-    - elastic
+      - elastic
     command: >
-       apm-server -e
-         -E apm-server.rum.enabled=true
-         -E setup.kibana.host=kibana:5601
-         -E setup.template.settings.index.number_of_replicas=0
-         -E apm-server.kibana.enabled=true
-         -E apm-server.kibana.host=kibana:5601
-         -E output.elasticsearch.hosts=["elasticsearch:9200"]
+      apm-server -e
+        -E apm-server.rum.enabled=true
+        -E apm-server.kibana.enabled=true
+        -E apm-server.kibana.host=kibana:5601
+        -E setup.kibana.host=kibana:5601
+        -E setup.template.settings.index.number_of_replicas=0
+        -E output.elasticsearch.hosts=["elasticsearch:9200"]
     healthcheck:
       interval: 10s
       retries: 12
-      test: curl --write-out 'HTTP %{http_code}' --fail --silent --output /dev/null http://localhost:8200/
+      # APM Server 8.x answers 404 on `/`, so accept any HTTP response as "up".
+      test: ["CMD-SHELL", "curl -s -o /dev/null http://localhost:8200/"]
 
   elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:7.6.2
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.19.25
     environment:
-    - bootstrap.memory_lock=true
-    - cluster.name=docker-cluster
-    - cluster.routing.allocation.disk.threshold_enabled=false
-    - discovery.type=single-node
-    - ES_JAVA_OPTS=-XX:UseAVX=2 -Xms1g -Xmx1g
-    ulimits:
-      memlock:
-        hard: -1
-        soft: -1
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
     volumes:
-    - esdata:/usr/share/elasticsearch/data
+      - esdata:/usr/share/elasticsearch/data
     ports:
-    - 9200:9200
+      - 9200:9200
     networks:
-    - elastic
+      - elastic
     healthcheck:
       interval: 20s
       retries: 10
-      test: curl -s http://localhost:9200/_cluster/health | grep -vq '"status":"red"'
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -vq '\"status\":\"red\"'"]
 
   kibana:
-    image: docker.elastic.co/kibana/kibana:7.6.2
+    image: docker.elastic.co/kibana/kibana:8.19.25
     depends_on:
       elasticsearch:
         condition: service_healthy
     environment:
       ELASTICSEARCH_URL: http://elasticsearch:9200
-      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
     ports:
-    - 5601:5601
+      - 5601:5601
     networks:
-    - elastic
+      - elastic
     healthcheck:
       interval: 10s
       retries: 20
-      test: curl --write-out 'HTTP %{http_code}' --fail --silent --output /dev/null http://localhost:5601/api/status
+      test: ["CMD-SHELL", "curl -s -f -o /dev/null http://localhost:5601/api/status"]
 
 volumes:
   esdata:
