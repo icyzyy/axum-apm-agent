@@ -1,7 +1,7 @@
 //! # Elastic APM/OpenTelemetry Tracing Library for Axum
 //!
 //! This library provides helper functions to configure OpenTelemetry tracing for Elastic APM
-//! in Axum applications (both REST APIs and reverse proxies).
+//! in Axum applications.
 //!
 //! It supports standard Elastic APM environment variables:
 //! - `ELASTIC_APM_SERVER_URL` (default: `http://localhost:8200`)
@@ -19,16 +19,17 @@
 //! # W3C trace context propagation
 //!
 //! `init_apm` installs the W3C `TraceContext` propagator globally, which is
-//! what lets [`apm_trace_layer`] continue an incoming `traceparent` and lets
-//! [`proxy_handler`] forward it to the upstream. If you build your own
-//! `SdkTracerProvider` and skip `init_apm`, install a propagator yourself
-//! (e.g. `opentelemetry_sdk::propagation::TraceContextPropagator`) or trace
+//! what lets [`apm_trace_layer`] continue an incoming `traceparent` (and
+//! lets [`inject_trace_context`] carry it into outgoing requests, e.g. when
+//! you proxy to an upstream). If you build your own `SdkTracerProvider` and
+//! skip `init_apm`, install a propagator yourself (e.g.
+//! `opentelemetry_sdk::propagation::TraceContextPropagator`) or trace
 //! propagation will silently no-op.
 
 use axum::{
-    extract::{ConnectInfo, Request, State},
+    extract::{ConnectInfo, Request},
     http::{
-        HeaderMap, StatusCode, Uri, Version,
+        HeaderMap, StatusCode, Version,
         header::{self, HeaderName, HeaderValue},
     },
     response::{IntoResponse, Response},
@@ -50,13 +51,6 @@ use tower::Service;
 use tower_http::trace::TraceLayer;
 use tracing::{Span, info_span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-
-/// Application state containing the HTTP client and upstream configuration.
-#[derive(Clone)]
-pub struct AppState {
-    pub client: ProxyClient,
-    pub upstream_url: Arc<String>,
-}
 
 /// Helper function to extract a header value as a string.
 fn extract_header(headers: &HeaderMap, header_name: HeaderName) -> String {
@@ -110,8 +104,9 @@ fn extract_parent_context(headers: &HeaderMap) -> Option<opentelemetry::Context>
 }
 
 /// Injects the W3C trace context of `cx` into outgoing request headers
-/// (`traceparent`/`tracestate`) so the upstream service continues the same trace.
-fn inject_trace_context(cx: &opentelemetry::Context, req: &mut Request) {
+/// (`traceparent`/`tracestate`) so a downstream service (e.g. an upstream
+/// you proxy to) continues the same trace.
+pub fn inject_trace_context<B>(cx: &opentelemetry::Context, req: &mut Request<B>) {
     global::get_text_map_propagator(|propagator| {
         let mut injector = HeaderInjector {
             headers: req.headers_mut(),
@@ -188,76 +183,9 @@ fn parse_sample_rate(raw: Option<String>) -> (f64, Vec<String>) {
 /// Errors returned by the fallible entry points of this library.
 #[derive(Debug, thiserror::Error)]
 pub enum ApmError {
-    /// `UPSTREAM_URL` is not set.
-    #[error("UPSTREAM_URL environment variable is required (e.g. https://api.example.com)")]
-    UpstreamUrlMissing,
-
-    /// `UPSTREAM_URL` is not a parseable URL.
-    #[error("UPSTREAM_URL {url:?} is not a valid URL: {source}")]
-    UpstreamUrlInvalid {
-        url: String,
-        #[source]
-        source: http::uri::InvalidUri,
-    },
-
-    /// `UPSTREAM_URL` is not an absolute URL with a scheme and host.
-    #[error(
-        "UPSTREAM_URL {url:?} must be an absolute URL with a scheme and host (e.g. https://api.example.com)"
-    )]
-    UpstreamUrlNotAbsolute { url: String },
-
-    /// `PORT` is set but is not a valid port number.
-    #[error("PORT {port:?} is not a valid port number: {source}")]
-    PortInvalid {
-        port: String,
-        #[source]
-        source: std::num::ParseIntError,
-    },
-
     /// The OTLP exporter could not be built.
     #[error("failed to build the OTLP exporter: {0}")]
     ExporterBuild(#[from] opentelemetry_otlp::ExporterBuildError),
-}
-
-/// Reads and validates the `UPSTREAM_URL` environment variable.
-///
-/// Fails when the variable is unset, is not a valid URL, or is not an
-/// absolute URL with a scheme and host (e.g. `https://api.example.com`), so a
-/// misconfigured proxy never silently forwards traffic to an unintended host.
-///
-/// # Errors
-///
-/// Returns an [`ApmError`] naming the problem when `UPSTREAM_URL` is unset,
-/// unparseable, or missing a scheme/host.
-pub fn resolve_upstream_url() -> Result<String, ApmError> {
-    let url = std::env::var("UPSTREAM_URL").map_err(|_| ApmError::UpstreamUrlMissing)?;
-    let uri: Uri = url.parse().map_err(|source| ApmError::UpstreamUrlInvalid {
-        url: url.clone(),
-        source,
-    })?;
-    if uri.scheme_str().is_none() || uri.host().is_none() {
-        return Err(ApmError::UpstreamUrlNotAbsolute { url });
-    }
-    Ok(url)
-}
-
-/// Reads the `PORT` environment variable.
-///
-/// Defaults to `3000` when unset or blank; fails when set to a value that is
-/// not a valid port number, so a typo cannot silently move the listener.
-///
-/// # Errors
-///
-/// Returns [`ApmError::PortInvalid`] when `PORT` is set to a non-numeric or
-/// out-of-range value.
-pub fn resolve_port() -> Result<u16, ApmError> {
-    match std::env::var("PORT") {
-        Ok(raw) if !raw.trim().is_empty() => raw
-            .trim()
-            .parse::<u16>()
-            .map_err(|source| ApmError::PortInvalid { port: raw, source }),
-        _ => Ok(3000),
-    }
 }
 
 /// Resolves the APM node name: the `ELASTIC_APM_NODE_NAME` environment
@@ -804,10 +732,9 @@ fn make_http_span<B>(request: &Request<B>) -> Span {
         // to the OTel span: tracing drops values for fields that were not
         // declared when the span was created. Unrecorded `Empty` fields are
         // omitted from the exported span, so these add no attributes to
-        // spans that never get an error or are not proxied requests.
+        // spans that never get an error.
         "error.type" = tracing::field::Empty,
         "error.message" = tracing::field::Empty,
-        "upstream_uri" = tracing::field::Empty,
     );
 
     // Record the matched route pattern so the APM UI can display and group by
@@ -1040,72 +967,6 @@ fn extract_panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 #[must_use]
 pub fn apm_panic_recovery_layer() -> ApmPanicRecoveryLayer {
     ApmPanicRecoveryLayer
-}
-
-/// Type alias for the Hyper legacy client used to forward requests.
-pub type ProxyClient = hyper_util::client::legacy::Client<
-    hyper_util::client::legacy::connect::HttpConnector,
-    axum::body::Body,
->;
-
-/// Default handler for proxying incoming HTTP requests to an upstream target.
-///
-/// Uses the upstream URL from `AppState` instead of reading environment variables
-/// on each request for better performance.
-///
-/// The resolved `upstream_uri` is recorded on the *current* APM span (the
-/// request span created by [`apm_trace_layer`]) rather than on a dedicated
-/// span of its own, so that no extra span is exported per proxied request and
-/// nothing is exported when recording is disabled.
-pub async fn proxy_handler(
-    State(state): State<AppState>,
-    mut req: Request,
-) -> Result<Response, StatusCode> {
-    // Retrieve path and query from the incoming request URI
-    let path_query = req
-        .uri()
-        .path_and_query()
-        .map(|v| v.as_str())
-        .unwrap_or("/");
-
-    // Construct the destination URI pointing to the upstream server
-    let uri_str = format!("{}{}", state.upstream_url.trim_end_matches('/'), path_query);
-    let target_uri = uri_str.parse::<Uri>().map_err(|e| {
-        tracing::error!("Failed to parse target URI: {}", e);
-        StatusCode::BAD_REQUEST
-    })?;
-
-    // Record target URI and details in the current tracing span
-    let span = Span::current();
-    span.record("upstream_uri", &uri_str);
-
-    // Update the request URI to target the upstream server
-    *req.uri_mut() = target_uri;
-
-    // Rewrite the Host header to match the new destination
-    if let Some(host) = req.uri().host() {
-        let host_val = if let Some(port) = req.uri().port_u16() {
-            format!("{}:{}", host, port)
-        } else {
-            host.to_string()
-        };
-
-        if let Ok(header_val) = header::HeaderValue::from_str(&host_val) {
-            req.headers_mut().insert(header::HOST, header_val);
-        }
-    }
-
-    // Propagate the trace context to the upstream so it continues the same trace
-    let cx = Span::current().context();
-    inject_trace_context(&cx, &mut req);
-
-    // Forward the request to the upstream using the hyper client
-    let response = state.client.request(req).await.map_err(|e| {
-        tracing::error!("Failed to proxy request: {}", e);
-        StatusCode::BAD_GATEWAY
-    })?;
-
-    Ok(response.into_response())
 }
 
 #[cfg(test)]
@@ -1734,63 +1595,6 @@ mod tests {
         );
     }
 
-    /// The bundled proxy shape (`fallback(proxy_handler)`) must also export
-    /// no spans when recording is disabled: `proxy_handler` must not create
-    /// its own span, or it would be exported as a root span even with the
-    /// http span disabled.
-    #[tokio::test]
-    async fn proxy_handler_exports_no_span_when_recording_is_disabled() {
-        use axum::Router;
-        use hyper_util::client::legacy::connect::HttpConnector;
-        use hyper_util::rt::TokioExecutor;
-        use opentelemetry::trace::TracerProvider as _;
-        use opentelemetry_sdk::trace::InMemorySpanExporter;
-        use tower::ServiceExt as _;
-
-        let _guard = SUBSCRIBER_LOCK.lock().await;
-        let _recording = RecordingGuard::set(false);
-
-        let exporter = InMemorySpanExporter::default();
-        let provider = SdkTracerProvider::builder()
-            .with_simple_exporter(exporter.clone())
-            .build();
-        global::set_tracer_provider(provider.clone());
-
-        let tracer = provider.tracer("test");
-        let subscriber =
-            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
-        let _sub_guard = tracing::subscriber::set_default(subscriber);
-
-        // The same router shape as the bundled proxy binary: a fallback to
-        // `proxy_handler`. The upstream URL is deliberately malformed so the
-        // handler fails fast at URI parsing (400) without any network I/O —
-        // the response status is irrelevant here.
-        let state = AppState {
-            client: hyper_util::client::legacy::Client::<(), ()>::builder(TokioExecutor::new())
-                .build(HttpConnector::new()),
-            upstream_url: Arc::new("not a valid upstream url".to_string()),
-        };
-        let app = Router::new()
-            .fallback(proxy_handler)
-            .with_state(state)
-            .layer(apm_trace_layer());
-
-        let req = Request::builder()
-            .uri("/anything")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let _ = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
-
-        let spans = exporter.get_finished_spans().unwrap();
-        assert!(
-            spans.is_empty(),
-            "no span should be exported when recording is disabled, got: {:?}",
-            spans.iter().map(|s| s.name.to_string()).collect::<Vec<_>>()
-        );
-    }
-
     /// End-to-end W3C propagation: a request carrying a sampled `traceparent`
     /// must produce an exported span that continues the *remote* trace
     /// (same trace ID, remote parent span ID) instead of starting a new one.
@@ -2012,118 +1816,6 @@ mod tests {
     // Tests that mutate process environment variables must hold this lock:
     // tests run in parallel threads of one process, and env vars are global.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[test]
-    fn resolve_upstream_url_fails_when_unset() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: env mutation serialized by ENV_LOCK.
-        unsafe { std::env::remove_var("UPSTREAM_URL") };
-        let err = resolve_upstream_url().unwrap_err();
-        assert!(
-            err.to_string().contains("UPSTREAM_URL"),
-            "error should name the missing variable: {err}"
-        );
-    }
-
-    #[test]
-    fn resolve_upstream_url_fails_when_not_a_valid_url() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: env mutation serialized by ENV_LOCK.
-        unsafe { std::env::set_var("UPSTREAM_URL", "not a url") };
-        let err = resolve_upstream_url().unwrap_err();
-        assert!(
-            err.to_string().contains("not a valid"),
-            "error should explain the URL is invalid: {err}"
-        );
-        // SAFETY: env mutation serialized by ENV_LOCK.
-        unsafe { std::env::remove_var("UPSTREAM_URL") };
-    }
-
-    #[test]
-    fn resolve_upstream_url_returns_the_configured_url() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: env mutation serialized by ENV_LOCK.
-        unsafe { std::env::set_var("UPSTREAM_URL", "https://api.example.com") };
-        assert_eq!(resolve_upstream_url().unwrap(), "https://api.example.com");
-        // SAFETY: env mutation serialized by ENV_LOCK.
-        unsafe { std::env::remove_var("UPSTREAM_URL") };
-    }
-
-    #[test]
-    fn resolve_upstream_url_rejects_urls_without_a_scheme() {
-        // A forgotten scheme (e.g. `api.example.com`) must fail at startup,
-        // not start the proxy and 502 every request at runtime.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        for invalid in ["api.example.com", "localhost:3000"] {
-            // SAFETY: env mutation serialized by ENV_LOCK.
-            unsafe { std::env::set_var("UPSTREAM_URL", invalid) };
-            let err = resolve_upstream_url().unwrap_err();
-            assert!(
-                err.to_string().contains("absolute"),
-                "error should explain the URL must be absolute: {err}"
-            );
-        }
-        // SAFETY: env mutation serialized by ENV_LOCK.
-        unsafe { std::env::remove_var("UPSTREAM_URL") };
-    }
-
-    #[test]
-    fn resolve_upstream_url_rejects_relative_paths() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: env mutation serialized by ENV_LOCK.
-        unsafe { std::env::set_var("UPSTREAM_URL", "/path") };
-        let err = resolve_upstream_url().unwrap_err();
-        assert!(
-            err.to_string().contains("absolute"),
-            "error should explain the URL must be absolute: {err}"
-        );
-        // SAFETY: env mutation serialized by ENV_LOCK.
-        unsafe { std::env::remove_var("UPSTREAM_URL") };
-    }
-
-    #[test]
-    fn resolve_port_defaults_to_3000_when_unset() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: env mutation serialized by ENV_LOCK.
-        unsafe { std::env::remove_var("PORT") };
-        assert_eq!(resolve_port().unwrap(), 3000);
-    }
-
-    #[test]
-    fn resolve_port_defaults_to_3000_when_blank() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: env mutation serialized by ENV_LOCK.
-        unsafe { std::env::set_var("PORT", "   ") };
-        assert_eq!(resolve_port().unwrap(), 3000);
-        // SAFETY: env mutation serialized by ENV_LOCK.
-        unsafe { std::env::remove_var("PORT") };
-    }
-
-    #[test]
-    fn resolve_port_parses_a_valid_port() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: env mutation serialized by ENV_LOCK.
-        unsafe { std::env::set_var("PORT", " 8080 ") };
-        assert_eq!(resolve_port().unwrap(), 8080);
-        // SAFETY: env mutation serialized by ENV_LOCK.
-        unsafe { std::env::remove_var("PORT") };
-    }
-
-    #[test]
-    fn resolve_port_fails_on_an_invalid_port() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        for invalid in ["not-a-port", "70000", "-1"] {
-            // SAFETY: env mutation serialized by ENV_LOCK.
-            unsafe { std::env::set_var("PORT", invalid) };
-            let err = resolve_port().unwrap_err();
-            assert!(
-                err.to_string().contains("PORT"),
-                "error should name the variable: {err}"
-            );
-        }
-        // SAFETY: env mutation serialized by ENV_LOCK.
-        unsafe { std::env::remove_var("PORT") };
-    }
 
     #[test]
     fn init_apm_reports_config_warnings_in_the_returned_config() {

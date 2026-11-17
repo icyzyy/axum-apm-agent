@@ -1,13 +1,6 @@
 use axum::Router;
-use axum_apm::{AppState, ProxyClient, apm_otel_layer, apm_trace_layer, init_apm, proxy_handler};
-use hyper_util::{client::legacy::connect::HttpConnector, rt::TokioExecutor};
-use std::sync::Arc;
+use axum_apm::{apm_otel_layer, apm_trace_layer, init_apm};
 use tracing_subscriber::layer::SubscriberExt;
-
-fn test_client() -> ProxyClient {
-    hyper_util::client::legacy::Client::<(), ()>::builder(TokioExecutor::new())
-        .build(HttpConnector::new())
-}
 
 #[test]
 fn init_apm_returns_a_working_provider() {
@@ -32,49 +25,6 @@ fn init_apm_returns_a_working_provider() {
 #[test]
 fn apm_trace_layer_creation() {
     let _layer = apm_trace_layer();
-}
-
-#[test]
-fn app_state_creation() {
-    let state = AppState {
-        client: test_client(),
-        upstream_url: Arc::new("https://httpbin.org".to_string()),
-    };
-
-    assert_eq!(state.upstream_url.as_str(), "https://httpbin.org");
-}
-
-#[test]
-fn router_with_state() {
-    let state = AppState {
-        client: test_client(),
-        upstream_url: Arc::new("https://httpbin.org".to_string()),
-    };
-
-    let app: Router = Router::new()
-        .fallback(proxy_handler)
-        .with_state(state)
-        .layer(apm_trace_layer());
-
-    // Just verify the router can be created
-    let _ = app;
-}
-
-#[tokio::test]
-async fn proxy_handler_invalid_upstream_uri() {
-    // proxy_handler returns BAD_REQUEST when the composed upstream URI is invalid
-    let state = AppState {
-        client: test_client(),
-        upstream_url: Arc::new("invalid-url".to_string()),
-    };
-
-    let req = axum::http::Request::builder()
-        .uri("http://localhost:3000")
-        .body(axum::body::Body::empty())
-        .unwrap();
-
-    let result = proxy_handler(axum::extract::State(state), req).await;
-    assert_eq!(result.unwrap_err(), axum::http::StatusCode::BAD_REQUEST);
 }
 
 /// Exercises the documented public-API recipe end to end:

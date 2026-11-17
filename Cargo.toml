@@ -8,8 +8,6 @@ rust-version = "1.85"
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1.52", features = ["full"] }
-hyper = { version = "1.10", features = ["full"] }
-hyper-util = { version = "0.1", features = ["client", "client-legacy", "server-auto"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 opentelemetry = { version = "0.32", features = ["trace"] }
@@ -18,8 +16,6 @@ opentelemetry-otlp = { version = "0.32", features = ["http-proto", "reqwest-bloc
 tracing-opentelemetry = "0.33"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["trace"] }
-http = "1.4"
-http-body-util = "0.1"
 hostname = "0.4"
 regex = "1.12"
 thiserror = "2"
