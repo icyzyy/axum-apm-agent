@@ -79,24 +79,42 @@ fn url_patterns_match(url_path: &str, patterns: &[String]) -> bool {
     false
 }
 
-/// Extracts the URL path from span attributes, checking common OpenTelemetry
-/// semantic conventions: `url.path` (set by [`apm_trace_layer`](crate::apm_trace_layer)),
-/// plus the legacy `http.target` / `http.route` for spans created elsewhere.
-fn extract_url_path_from_attrs(attributes: &[KeyValue]) -> Option<String> {
+/// Extracts the request URL (path + query) from span attributes, checking
+/// common OpenTelemetry semantic conventions. This mirrors the Go agent, which
+/// matches the full request URL (path + query) against ignore patterns — not
+/// just the path.
+///
+/// Checks, in order:
+/// - `http.target` (legacy; already path + query).
+/// - `url.path` + `url.query` (combined to form path + query).
+fn extract_url_from_attrs(attributes: &[KeyValue]) -> Option<String> {
+    // Prefer the legacy http.target (already path + query).
     for kv in attributes {
         let Value::String(s) = &kv.value else {
             continue;
         };
-        if !matches!(kv.key.as_str(), "url.path" | "http.target" | "http.route") {
-            continue;
+        if kv.key.as_str() == "http.target" {
+            return Some(s.as_ref().to_string());
         }
-        let path = s.as_ref();
-        if let Some(idx) = path.rfind('?') {
-            return Some(path[..idx].to_string());
-        }
-        return Some(path.to_string());
     }
-    None
+    // Otherwise, combine url.path and url.query.
+    let mut path: Option<String> = None;
+    let mut query: Option<String> = None;
+    for kv in attributes {
+        let Value::String(s) = &kv.value else {
+            continue;
+        };
+        match kv.key.as_str() {
+            "url.path" => path = Some(s.as_ref().to_string()),
+            "url.query" => query = Some(s.as_ref().to_string()),
+            _ => {}
+        }
+    }
+    match (path, query) {
+        (Some(path), Some(query)) if !query.is_empty() => Some(format!("{path}?{query}")),
+        (Some(path), _) => Some(path),
+        _ => None,
+    }
 }
 
 /// Custom sampler that ignores specified URL patterns and applies a configurable
@@ -178,8 +196,8 @@ impl ShouldSample for ApmSampler {
         }
 
         if !self.ignore_patterns.is_empty()
-            && let Some(url_path) = extract_url_path_from_attrs(attributes)
-            && url_patterns_match(&url_path, &self.ignore_patterns)
+            && let Some(url) = extract_url_from_attrs(attributes)
+            && url_patterns_match(&url, &self.ignore_patterns)
         {
             return SamplingResult {
                 decision: SamplingDecision::Drop,
@@ -363,5 +381,68 @@ mod tests {
             &[],
         );
         assert_eq!(res.decision, SamplingDecision::RecordAndSample);
+    }
+
+    // --- Ignore patterns match the full URL (path + query), like the Go agent ---
+
+    /// A pattern that includes the query string must match a URL with that
+    /// query, mirroring the Go agent's full-URL (path + query) matching.
+    #[test]
+    fn ignore_pattern_matches_full_url_with_query() {
+        let s = sampler(1.0, vec!["/health?x=1".to_string()]);
+        let attrs = vec![
+            KeyValue::new("url.path", "/health"),
+            KeyValue::new("url.query", "x=1"),
+        ];
+        let res = s.should_sample(
+            None,
+            TraceId::from(1u128),
+            "GET /health?x=1",
+            &SpanKind::Server,
+            &attrs,
+            &[],
+        );
+        assert_eq!(res.decision, SamplingDecision::Drop);
+    }
+
+    /// A path-only pattern must NOT match a URL that carries a query string,
+    /// because the Go agent matches the full URL (path + query). This is a
+    /// deliberate behavior change from the previous path-only matching.
+    #[test]
+    fn ignore_pattern_path_only_does_not_match_url_with_query() {
+        let s = sampler(1.0, vec!["/health".to_string()]);
+        let attrs = vec![
+            KeyValue::new("url.path", "/health"),
+            KeyValue::new("url.query", "x=1"),
+        ];
+        let res = s.should_sample(
+            None,
+            TraceId::from(1u128),
+            "GET /health?x=1",
+            &SpanKind::Server,
+            &attrs,
+            &[],
+        );
+        assert_eq!(res.decision, SamplingDecision::RecordAndSample);
+    }
+
+    /// A URL with no query string is matched by a path-only pattern (the
+    /// common case), so existing ignore configurations keep working.
+    #[test]
+    fn ignore_pattern_path_only_matches_url_without_query() {
+        let s = sampler(1.0, vec!["/health".to_string()]);
+        let attrs = vec![
+            KeyValue::new("url.path", "/health"),
+            KeyValue::new("url.query", ""),
+        ];
+        let res = s.should_sample(
+            None,
+            TraceId::from(1u128),
+            "GET /health",
+            &SpanKind::Server,
+            &attrs,
+            &[],
+        );
+        assert_eq!(res.decision, SamplingDecision::Drop);
     }
 }
