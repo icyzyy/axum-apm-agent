@@ -1,7 +1,7 @@
 use crate::propagation::{extract_header, extract_parent_context};
 use axum::{
     extract::{ConnectInfo, Request},
-    http::{StatusCode, Version, header},
+    http::{Version, header},
     response::Response,
 };
 use std::net::SocketAddr;
@@ -119,12 +119,14 @@ fn make_http_span<B>(request: &Request<B>) -> Span {
 
     // Use the matched route pattern (axum's `MatchedPath`) for the span name
     // when available, so the APM transaction view stays bounded (e.g.
-    // `GET /users/{id}` instead of `GET /users/123`). Fall back to the
-    // concrete path when no route matched (e.g. a reverse-proxy fallback).
+    // `GET /users/{id}` instead of `GET /users/123`). When no route matched
+    // (a 404/405), name it `METHOD unknown route` — mirroring the Go agent's
+    // `UnknownRouteRequestName` — so every unknown route collapses to a single
+    // transaction instead of one per unique path.
     let matched_path = request.extensions().get::<axum::extract::MatchedPath>();
     let otel_name = match matched_path {
         Some(mp) => format!("{} {}", method, mp.as_str()),
-        None => format!("{} {}", method, path),
+        None => format!("{method} unknown route"),
     };
 
     // Declare and record standard OTel/ECS HTTP semantic fields.
@@ -168,12 +170,17 @@ fn make_http_span<B>(request: &Request<B>) -> Span {
         "error.message" = tracing::field::Empty,
     );
 
-    // Record the matched route pattern so the APM UI can display and group by
-    // it. Only set when a route actually matched; unmatched requests get
-    // `http.route = "unknown route"` at response time (see
-    // `record_http_response`).
-    if let Some(mp) = matched_path {
-        span.record("http.route", mp.as_str());
+    // Record the route so the APM UI can display and group by it: the matched
+    // route pattern when a route matched, or "unknown route" when it did not.
+    // Decided here (at span creation) rather than at response time so a
+    // handler-returned 404/405 on a matched route keeps its pattern.
+    match matched_path {
+        Some(mp) => {
+            span.record("http.route", mp.as_str());
+        }
+        None => {
+            span.record("http.route", "unknown route");
+        }
     }
 
     // Continue an existing trace when the client sent W3C trace context.
@@ -191,18 +198,11 @@ fn record_http_response<B>(response: &Response<B>, _latency: std::time::Duration
     // Record status code
     span.record("http.response.status_code", response.status().as_u16());
 
-    // For 404/405 responses, record `http.route` as "unknown route", mirroring
-    // the Go agent's `UnknownRouteRequestName`. This is correct for requests
-    // that matched no route. Note: a matched route whose handler returns
-    // 404/405 (e.g. "resource not found") has its `http.route` overwritten
-    // here; the span name (the APM transaction name) remains the route
-    // pattern, so the transaction view is unaffected.
-    if matches!(
-        response.status(),
-        StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
-    ) {
-        span.record("http.route", "unknown route");
-    }
+    // `http.route` is decided at span-creation time in `make_http_span`
+    // (the route pattern when a route matched, "unknown route" otherwise), so
+    // it is not touched here. Overwriting it at response time would both
+    // clobber a matched route's pattern on a handler-returned 404/405 and emit
+    // a duplicate attribute.
 
     // Record response size (only available when the upstream sends Content-Length)
     if let Some(content_length) = response
@@ -247,6 +247,7 @@ pub fn apm_trace_layer_with_body<B>() -> ApmTraceLayer<B> {
 mod tests {
     use super::*;
     use crate::test_support::SUBSCRIBER_LOCK;
+    use axum::http::StatusCode;
     use opentelemetry::global;
     use opentelemetry::trace::{SpanKind, TraceId};
     use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
@@ -389,9 +390,11 @@ mod tests {
         assert_eq!(attr("url.path").as_deref(), Some("/users/123"));
     }
 
-    /// A request that matches no route (404) has no `MatchedPath`; the span
-    /// falls back to the actual path and records `http.route = "unknown
-    /// route"`, mirroring the Go agent's `UnknownRouteRequestName`.
+    /// A request that matches no route (404) has no `MatchedPath`; the span is
+    /// named `METHOD unknown route` (mirroring the Go agent's
+    /// `UnknownRouteRequestName`) and records `http.route = "unknown route"`.
+    /// This keeps the APM transaction view bounded: every unknown route
+    /// collapses to a single transaction instead of one per unique 404 path.
     #[tokio::test]
     async fn unmatched_route_records_unknown_route() {
         use axum::Router;
@@ -426,10 +429,10 @@ mod tests {
         let spans = exporter.get_finished_spans().unwrap();
         let http_span = spans
             .iter()
-            .find(|s| s.name == "GET /definitely/not/a/route")
+            .find(|s| s.name == "GET unknown route")
             .unwrap_or_else(|| {
                 panic!(
-                    "expected a span named by the actual path, got: {:?}",
+                    "expected a span named 'GET unknown route', got: {:?}",
                     spans.iter().map(|s| s.name.to_string()).collect::<Vec<_>>()
                 )
             });
@@ -441,6 +444,126 @@ mod tests {
                 .map(|kv| kv.value.as_str().into_owned())
         };
         assert_eq!(attr("http.route").as_deref(), Some("unknown route"));
+        // The concrete path is still recorded for reference.
+        assert_eq!(attr("url.path").as_deref(), Some("/definitely/not/a/route"));
+    }
+
+    /// A request that matches a route whose handler returns 404 (e.g. "resource
+    /// not found") must keep `http.route` as the route pattern — it must NOT be
+    /// overwritten to "unknown route" (mirroring the Go agent, which only uses
+    /// `UnknownRouteRequestName` when no route matched). The span is named by
+    /// the route pattern.
+    #[tokio::test]
+    async fn matched_route_404_keeps_the_route_pattern() {
+        use axum::Router;
+        use axum::routing::get;
+        use opentelemetry::trace::TracerProvider as _;
+        use tower::ServiceExt as _;
+
+        let _guard = SUBSCRIBER_LOCK.lock().await;
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        global::set_tracer_provider(provider.clone());
+
+        let tracer = provider.tracer("test");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+        let _sub_guard = tracing::subscriber::set_default(subscriber);
+
+        // A handler that returns 404 (e.g. "resource not found").
+        async fn not_found() -> StatusCode {
+            StatusCode::NOT_FOUND
+        }
+
+        let app = Router::new()
+            .route("/users/{id}", get(not_found))
+            .layer(apm_trace_layer());
+
+        let req = Request::builder()
+            .uri("/users/123")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let _ = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let http_span = spans
+            .iter()
+            .find(|s| s.name == "GET /users/{id}")
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a span named by the route pattern, got: {:?}",
+                    spans.iter().map(|s| s.name.to_string()).collect::<Vec<_>>()
+                )
+            });
+        let attr = |key: &str| {
+            http_span
+                .attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == key)
+                .map(|kv| kv.value.as_str().into_owned())
+        };
+        // The route pattern is kept, NOT overwritten to "unknown route".
+        assert_eq!(attr("http.route").as_deref(), Some("/users/{id}"));
+        assert_eq!(attr("http.response.status_code").as_deref(), Some("404"));
+    }
+
+    /// A request whose path matches a route but whose method is not allowed
+    /// (405) must be named by the route pattern (the path matched), mirroring
+    /// the Go agent — not collapsed to "unknown route".
+    #[tokio::test]
+    async fn method_not_allowed_uses_the_route_pattern() {
+        use axum::Router;
+        use opentelemetry::trace::TracerProvider as _;
+        use tower::ServiceExt as _;
+
+        let _guard = SUBSCRIBER_LOCK.lock().await;
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        global::set_tracer_provider(provider.clone());
+
+        let tracer = provider.tracer("test");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+        let _sub_guard = tracing::subscriber::set_default(subscriber);
+
+        // Only GET is allowed on /known; a POST returns 405.
+        let app = Router::new()
+            .route("/known", axum::routing::get(|| async { "ok" }))
+            .layer(apm_trace_layer());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/known")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let _ = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let http_span = spans
+            .iter()
+            .find(|s| s.name == "POST /known")
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a span named by the route pattern 'POST /known', got: {:?}",
+                    spans.iter().map(|s| s.name.to_string()).collect::<Vec<_>>()
+                )
+            });
+        let attr = |key: &str| {
+            http_span
+                .attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == key)
+                .map(|kv| kv.value.as_str().into_owned())
+        };
+        assert_eq!(attr("http.route").as_deref(), Some("/known"));
     }
 
     /// When `ELASTIC_APM_RECORDING` (or `ELASTIC_APM_ACTIVE`) is disabled, the
